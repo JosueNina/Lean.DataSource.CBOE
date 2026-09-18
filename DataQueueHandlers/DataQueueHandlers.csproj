@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>QuantConnect.DataSource.DataQueueHandlers</RootNamespace>
+    <AssemblyName>QuantConnect.DataSource.DataQueueHandlers.CBOE</AssemblyName>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <!-- copy the package dependencies to the output: the kafka client and its native 'runtimes' folder -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="QuantConnect.Lean.Engine" Version="2.5.*" />
+    <PackageReference Include="Confluent.Kafka" Version="2.15.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\QuantConnect.DataSource.csproj" />
+  </ItemGroup>
+
+</Project>
