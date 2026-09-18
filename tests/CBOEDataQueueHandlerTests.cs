@@ -179,6 +179,23 @@ namespace QuantConnect.DataLibrary.Tests
             Assert.Throws<ArgumentException>(() => _handler.SetJob(new Packets.LiveNodePacket { BrokerageData = new Dictionary<string, string>() }));
         }
 
+        [Test]
+        public void LoadsNativeLibrary()
+        {
+            TestableCBOEDataQueueHandler.LoadNative();
+
+            Assert.IsTrue(Confluent.Kafka.Library.IsLoaded);
+            Log.Trace($"librdkafka version: {Confluent.Kafka.Library.VersionString}");
+        }
+
+        [Test]
+        public void SetJobHandlesMissingBrokerageData()
+        {
+            // the job might have no brokerage data, we fallback to the configuration, which is not set here
+            Assert.Throws<ArgumentException>(() => _handler.SetJob(new Packets.LiveNodePacket { BrokerageData = null }));
+            Assert.Throws<ArgumentException>(() => _handler.SetJob(null));
+        }
+
         /// <summary>
         /// Requires the 'cboe-*', 'job-user-id', 'api-access-token' and 'data-folder' configuration values to be set,
         /// in the config.json file or as 'QC_*' environment variables, e.g. 'QC_CBOE_GROUP_ID'
@@ -239,6 +256,8 @@ namespace QuantConnect.DataLibrary.Tests
             public void Process(string message) => ProcessMessage(message);
 
             public static bool IsIndex(string topic) => IsIndexTopic(topic);
+
+            public static void LoadNative() => LoadNativeLibrary();
 
             // there is no market hours database available
             protected override NodaTime.DateTimeZone GetExchangeTimeZone(Symbol symbol) => TimeZones.NewYork;

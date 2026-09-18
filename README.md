@@ -19,6 +19,7 @@ The connection is started once the job is set, see `SetJob`.
 | `cboe-ssl-key-password` | The private key passphrase, if any |
 | `cboe-topics` | Optional, comma separated list of topics to consume, e.g. `csmi-idx-use1`, the main indices channel (SPX, VIX...) in us-east-1. Defaults to all the index topics (`<channel>-idx-<region>`) the certificate has access to |
 | `cboe-ssl-ca` | Optional, CA certificate to verify the brokers with. Defaults to the system trusted root certificates |
+| `cboe-librdkafka-location` | Optional, file or directory to load the native kafka client (`librdkafka`) from. By default it's searched for in the `runtimes` folder, or right next to, the assemblies |
 
 Notes:
 - When using the *Internet Gateway* connectivity method, the broker FQDNs have to resolve to the public IP addresses provided by Cboe,

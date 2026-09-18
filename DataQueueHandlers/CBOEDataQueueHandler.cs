@@ -20,7 +20,9 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 using System.Net.NetworkInformation;
 using System.Security.Cryptography;
 using Confluent.Kafka;
@@ -36,6 +38,7 @@ using QuantConnect.Securities;
 using QuantConnect.Securities.Index;
 using QuantConnect.Util;
 using Config = QuantConnect.Configuration.Config;
+using Library = Confluent.Kafka.Library;
 using DateTimeZone = NodaTime.DateTimeZone;
 
 namespace QuantConnect.DataSource.DataQueueHandlers
@@ -58,6 +61,7 @@ namespace QuantConnect.DataSource.DataQueueHandlers
         /// </summary>
         private const int IndexValueType = 3;
 
+        private static bool _nativeLibraryResolverSet;
         private static readonly TimeSpan _metadataTimeout = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan _retryDelay = TimeSpan.FromSeconds(10);
 
@@ -102,8 +106,9 @@ namespace QuantConnect.DataSource.DataQueueHandlers
                 return;
             }
 
-            // local deployments will not have these in the job, so we fallback to the configuration
-            Initialize(key => job.BrokerageData.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : Config.Get(key));
+            // local deployments will not have these in the job, which might not even have brokerage data, so we fallback to the configuration
+            var brokerageData = job?.BrokerageData;
+            Initialize(key => brokerageData != null && brokerageData.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : Config.Get(key));
         }
 
         /// <summary>
@@ -147,7 +152,8 @@ namespace QuantConnect.DataSource.DataQueueHandlers
         /// Handles a Cboe Global Indices feed message, emitting the index value to the aggregator
         /// </summary>
         /// <param name="message">The json message</param>
-        protected void ProcessMessage(string message)
+        /// <param name="topic">The topic the message is from</param>
+        protected void ProcessMessage(string message, string topic = null)
         {
             try
             {
@@ -167,7 +173,7 @@ namespace QuantConnect.DataSource.DataQueueHandlers
                     return;
                 }
 
-                var index = GetIndex(indexMessage.Symbol);
+                var index = GetIndex(indexMessage.Symbol, topic);
                 if (index == null)
                 {
                     return;
@@ -199,7 +205,7 @@ namespace QuantConnect.DataSource.DataQueueHandlers
         /// <summary>
         /// Gets the lean symbol and exchange time zone for the given ticker, null if not served
         /// </summary>
-        private IndexDetails GetIndex(string ticker)
+        private IndexDetails GetIndex(string ticker, string topic)
         {
             if (!_indexes.TryGetValue(ticker, out var index))
             {
@@ -210,6 +216,7 @@ namespace QuantConnect.DataSource.DataQueueHandlers
                     index = new IndexDetails(symbol, GetExchangeTimeZone(symbol));
                 }
                 _indexes[ticker] = index;
+                Log.Trace($"CBOEDataQueueHandler.GetIndex(): new ticker '{ticker}' topic '{topic}'{(index == null ? ", not served" : $" time zone {index.ExchangeTimeZone}")}. Count: {_indexes.Count}");
             }
             return index;
         }
@@ -256,6 +263,9 @@ namespace QuantConnect.DataSource.DataQueueHandlers
 
             _marketHoursDatabase = MarketHoursDatabase.FromDataFolder();
 
+            // optional, file or directory to load the native kafka client from, by default we will look for it
+            LoadNativeLibrary(getConfig("cboe-librdkafka-location"));
+
             _initialized = true;
             _consumerThread = new Thread(() => ConsumeLoop(consumerConfig, topicList)) { IsBackground = true, Name = "CBOEDataQueueHandler" };
             _consumerThread.Start();
@@ -290,7 +300,7 @@ namespace QuantConnect.DataSource.DataQueueHandlers
                             if (result?.Message?.Value != null)
                             {
                                 _connected = true;
-                                ProcessMessage(result.Message.Value);
+                                ProcessMessage(result.Message.Value, result.Topic);
                             }
                         }
                         catch (ConsumeException exception) when (!exception.Error.IsFatal)
@@ -313,6 +323,88 @@ namespace QuantConnect.DataSource.DataQueueHandlers
             }
             _connected = false;
             Log.Trace("CBOEDataQueueHandler.ConsumeLoop(): ended");
+        }
+
+        /// <summary>
+        /// Loads the native kafka client. By default it's found through the application dependencies file, which
+        /// will not hold it when we are loaded as a plugin, so we look for it ourselves, in the 'runtimes' folder it ships in or right next to the assemblies
+        /// </summary>
+        /// <param name="location">Optional file or directory to load it from</param>
+        protected static void LoadNativeLibrary(string location = null)
+        {
+            try
+            {
+                if (Library.IsLoaded)
+                {
+                    return;
+                }
+
+                var os = OperatingSystem.IsWindows() ? "win" : OperatingSystem.IsMacOS() ? "osx" : "linux";
+                var runtime = Path.Combine("runtimes", $"{os}-{RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}", "native");
+                var directories = new[]
+                    {
+                        Path.GetDirectoryName(typeof(Library).Assembly.Location),
+                        Path.GetDirectoryName(typeof(CBOEDataQueueHandler).Assembly.Location),
+                        AppContext.BaseDirectory,
+                        Directory.GetCurrentDirectory()
+                    }
+                    .Where(x => !string.IsNullOrEmpty(x))
+                    .SelectMany(x => new[] { Path.Combine(x, runtime), x })
+                    // the given location goes first
+                    .Prepend(location)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Select(Path.GetFullPath)
+                    .Distinct()
+                    .ToList();
+
+                // The kafka client own explicit load, 'Library.Load(path)', requires 'libdl.so' which is not available in recent linux distributions,
+                // so we resolve the libraries it asks for instead: the default build 'librdkafka' first, then the alternative ones, e.g. 'centos8-librdkafka'
+                if (!_nativeLibraryResolverSet)
+                {
+                    _nativeLibraryResolverSet = true;
+                    // we get called for each native method
+                    var handles = new ConcurrentDictionary<string, IntPtr>();
+                    NativeLibrary.SetDllImportResolver(typeof(Library).Assembly, (name, _, _) => handles.GetOrAdd(name, _ =>
+                    {
+                        if (!name.Contains("librdkafka", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return IntPtr.Zero;
+                        }
+
+                        var files = directories.SelectMany(x => File.Exists(x) ? new[] { x }
+                            : Directory.Exists(x) ? Directory.GetFiles(x, $"{name}.*") : Enumerable.Empty<string>());
+                        foreach (var file in files)
+                        {
+                            try
+                            {
+                                var handle = NativeLibrary.Load(file);
+                                Log.Trace($"CBOEDataQueueHandler.LoadNativeLibrary(): loaded {file}");
+                                return handle;
+                            }
+                            catch (Exception exception)
+                            {
+                                // expected for builds which dependencies are not installed, the client will ask for the next one
+                                Log.Trace($"CBOEDataQueueHandler.LoadNativeLibrary(): skipping {file}: {exception.Message.Split('\n')[0]}");
+                            }
+                        }
+                        // default behavior
+                        return IntPtr.Zero;
+                    }));
+                }
+
+                // triggers the load
+                Log.Trace($"CBOEDataQueueHandler.LoadNativeLibrary(): using librdkafka {Library.VersionString}");
+            }
+            catch (DllNotFoundException exception)
+            {
+                Log.Error($"CBOEDataQueueHandler.LoadNativeLibrary(): could not load the native kafka client 'librdkafka': {exception.Message}"
+                    + " It can be set using 'cboe-librdkafka-location', by default it's searched for in the 'runtimes' folder or right next to the assemblies");
+            }
+            catch (Exception exception)
+            {
+                // we'll go with the default behavior
+                Log.Error(exception);
+            }
         }
 
         /// <summary>
